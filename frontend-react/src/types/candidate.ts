@@ -22,6 +22,13 @@ export interface AuditEntry {
   note?: string;
 }
 
+export interface CandidateWriteInput {
+  title: string;
+  content: string;
+  provenance?: string;
+  confidence?: number;
+}
+
 export interface Candidate {
   id: string;
   title: string;
@@ -43,6 +50,8 @@ export interface EvalMetrics {
   correctionsBefore?: number;
   correctionsAfter?: number;
   source: string;
+  /** Set when a configured metrics URL failed and placeholder data is shown. */
+  fetchError?: string;
 }
 
 export interface ApiConflictError extends Error {

@@ -1,7 +1,8 @@
-import type { CandidateState } from "../types/candidate";
+import type { CandidateState, CandidateWriteInput } from "../types/candidate";
 import { nextPromotionState } from "./candidateModel";
 
 export const CONTRACT_HEADER = "X-Praxis-Contract";
+export const ORG_HEADER = "X-Praxis-Org";
 
 const RESOLUTION_TO_API: Record<string, string> = {
   keep_primary: "keep_a",
@@ -14,7 +15,7 @@ export function contractVersion(): string {
   return import.meta.env.VITE_PRAXIS_CONTRACT_VERSION?.trim() || "1";
 }
 
-export function contractHeaders(token?: string): HeadersInit {
+export function contractHeaders(token?: string, orgId?: string): HeadersInit {
   const headers: Record<string, string> = {
     Accept: "application/json",
     "Content-Type": "application/json",
@@ -22,6 +23,9 @@ export function contractHeaders(token?: string): HeadersInit {
   };
   if (token) {
     headers.Authorization = `Bearer ${token}`;
+  }
+  if (orgId) {
+    headers[ORG_HEADER] = orgId;
   }
   return headers;
 }
@@ -40,6 +44,41 @@ export function buildPromoteBodyImplicit(): Record<string, never> {
 
 export function buildRejectBody(reason?: string): { reason?: string } {
   return reason ? { reason } : {};
+}
+
+export function buildCreateBody(input: CandidateWriteInput): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    title: input.title.trim(),
+    content: input.content.trim(),
+    state: "proposed",
+    confidence: input.confidence ?? 0.5,
+  };
+  if (input.provenance?.trim()) {
+    body.provenance = input.provenance.trim();
+  }
+  return body;
+}
+
+export function buildUpdateBody(input: CandidateWriteInput): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    title: input.title.trim(),
+    content: input.content.trim(),
+  };
+  if (input.provenance?.trim()) {
+    body.provenance = input.provenance.trim();
+  }
+  if (input.confidence != null) {
+    body.confidence = input.confidence;
+  }
+  return body;
+}
+
+export function normalizeResolution(resolution: string): string {
+  const mapped = RESOLUTION_TO_API[resolution];
+  if (!mapped) {
+    throw new Error(`Unsupported resolution ${resolution}`);
+  }
+  return mapped;
 }
 
 export function buildResolveBody(

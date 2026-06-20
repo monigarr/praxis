@@ -26,7 +26,8 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
-from knowledge.evals.eval_def import EvalContext, Rubric
+from knowledge.evals.eval_def import EvalContext, JudgeResult, Rubric
+from knowledge.observability import tracing
 
 # Tools the boxed agent may use. Bash / WebSearch / WebFetch are explicitly
 # denied so it can only produce the answer from its own knowledge + the
@@ -62,7 +63,10 @@ def _default_run_cli(args: list[str], cwd: Path, env: dict, timeout: int) -> str
         timeout=timeout,
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"claude exited {proc.returncode}: {proc.stderr.strip()[:500]}")
+        # The CLI reports some failures (e.g. an invalid --model) on stdout, not
+        # stderr — fall back to stdout so the reason isn't swallowed.
+        detail = (proc.stderr.strip() or proc.stdout.strip())[:500]
+        raise RuntimeError(f"claude exited {proc.returncode}: {detail}")
     return proc.stdout
 
 
@@ -75,6 +79,23 @@ def _result_text(stdout: str) -> str:
     if isinstance(data, dict):
         return str(data.get("result", "")).strip()
     return stdout.strip()
+
+
+def _claude_usage(stdout: str) -> dict:
+    """Pull cost / token usage / turns out of `claude --output-format json` stdout."""
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    usage = data.get("usage") or {}
+    return {
+        "cost_usd": data.get("total_cost_usd"),
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "num_turns": data.get("num_turns"),
+    }
 
 
 def _extract_json(text: str) -> dict:
@@ -121,15 +142,29 @@ class ClaudeCodeRunner:
     file is absent.
     """
 
+    # Mounts fixtures into a real working dir and grades the files the agent
+    # writes — so it can faithfully run cases that need a sandbox.
+    provides = frozenset({"sandbox"})
+
+    @staticmethod
+    def serves_model(model: str) -> bool:
+        """The Claude CLI takes aliases (sonnet/opus) or claude-* names — never a
+        provider-prefixed id, so a ``/`` means it's another backend's model."""
+        return "/" not in model
+
     def __init__(
         self,
         output_file: str = "poem.txt",
         run_cli: CliRunner | None = None,
         timeout: int = 240,
+        model: str | None = None,
     ) -> None:
         self.output_file = output_file
         self.run_cli = run_cli or _default_run_cli
         self.timeout = timeout
+        # Default model: explicit arg, else CLAUDE_CODE_MODEL, else None (= the
+        # `claude` CLI's own default). Mirrors OPENROUTER_MODEL for OpenRouter.
+        self.model = model or os.getenv("CLAUDE_CODE_MODEL")
 
     def run(self, case, reader) -> EvalContext:
         # The knowledge graph is a data object — read it and inject it into the
@@ -145,6 +180,9 @@ class ClaudeCodeRunner:
             if getattr(case, "fixture_path", None):
                 shutil.copytree(case.fixture_path, workdir, dirs_exist_ok=True)
             args = ["-p", case.seed_prompt, "--output-format", "json"]
+            model = getattr(case, "model", None) or self.model  # case pin > env/default
+            if model:
+                args += ["--model", model]
             if knowledge.strip():
                 args += ["--append-system-prompt", knowledge]
             args += [
@@ -155,21 +193,48 @@ class ClaudeCodeRunner:
                 "--permission-mode",
                 "bypassPermissions",
             ]
-            stdout = self.run_cli(args, workdir, _subscription_env(), self.timeout)
-            output = self._collect_output(workdir, stdout)
-            return EvalContext(case_id=case.id, output=output, checkout_path=str(workdir))
+            with tracing.llm_span(
+                "claude_code.agent",
+                kind="AGENT",
+                model="claude-code",
+                input_value=case.seed_prompt,
+            ) as span:
+                stdout = self.run_cli(args, workdir, _subscription_env(), self.timeout)
+                output, source = self._collect_output(workdir, stdout)
+                usage = _claude_usage(stdout)
+                tracing.record_output(
+                    span,
+                    output=output,
+                    prompt_tokens=usage.get("input_tokens"),
+                    completion_tokens=usage.get("output_tokens"),
+                    cost_usd=usage.get("cost_usd"),
+                    **{
+                        "praxis.case_id": case.id,
+                        "praxis.output_source": source,
+                        "praxis.num_turns": usage.get("num_turns"),
+                    },
+                )
+                return EvalContext(
+                    case_id=case.id,
+                    output=output,
+                    checkout_path=str(workdir),
+                    raw_response=stdout,
+                    output_source=source,
+                    injected_knowledge=knowledge,
+                )
 
-    def _collect_output(self, workdir: Path, stdout: str) -> str:
-        """The graded output: the named artifact if present, else everything the
-        agent wrote into the box, else the assistant's final text.
+    def _collect_output(self, workdir: Path, stdout: str) -> tuple[str, str]:
+        """The graded output plus which artifact it came from.
 
-        Reading the box's files keeps the runner case-agnostic — a poem case
-        yields poem.txt, a code case yields the source files — so one runner
-        drives every case.
+        The named artifact if present, else everything the agent wrote into the
+        box, else the assistant's final text. Reading the box's files keeps the
+        runner case-agnostic — a poem case yields poem.txt, a code case yields
+        the source files — so one runner drives every case. The source tag is
+        recorded on the transcript so a graded result is traceable to its origin.
         """
         preferred = workdir / self.output_file
         if preferred.exists():
-            return preferred.read_text(encoding="utf-8")
+            return preferred.read_text(encoding="utf-8"), "named_file"
 
         parts: list[str] = []
         for path in sorted(workdir.rglob("*")):
@@ -183,21 +248,24 @@ class ClaudeCodeRunner:
                 continue
             parts.append(f"# {path.relative_to(workdir).as_posix()}\n{text}")
 
-        return "\n\n".join(parts) if parts else _result_text(stdout)
+        if parts:
+            return "\n\n".join(parts), "box_sweep"
+        return _result_text(stdout), "final_text"
 
 
 class ClaudeCodeJudge:
     """Rubric judge that also runs through real Claude Code (subscription).
 
     Runs in a fresh temp dir with no CLAUDE.md so the injected knowledge can't
-    bias the grade. Returns a score in [0, 1].
+    bias the grade. Returns a :class:`JudgeResult` (overall score in [0, 1],
+    per-item scores, and the raw response for the transcript).
     """
 
     def __init__(self, run_cli: CliRunner | None = None, timeout: int = 120) -> None:
         self.run_cli = run_cli or _default_run_cli
         self.timeout = timeout
 
-    def __call__(self, rubric: Rubric, ctx: EvalContext) -> float:
+    def __call__(self, rubric: Rubric, ctx: EvalContext) -> JudgeResult:
         items = "\n".join(f"- ({it.weight}) {it.id}: {it.criterion}" for it in rubric.items)
         prompt = (
             "You are grading an artifact against a rubric. Score each criterion "
@@ -207,18 +275,31 @@ class ClaudeCodeJudge:
             f"RUBRIC:\n{items}\n\n"
             f"ARTIFACT:\n{ctx.output}\n"
         )
-        with tempfile.TemporaryDirectory() as tmp:
-            args = [
-                "-p",
-                prompt,
-                "--output-format",
-                "json",
-                "--disallowedTools",
-                *_ALLOWED_TOOLS,
-                *_DISALLOWED_TOOLS,
-            ]
-            stdout = self.run_cli(args, Path(tmp), _subscription_env(), self.timeout)
+        with tracing.llm_span(
+            "claude_code.judge", kind="LLM", model="claude-code", input_value=prompt
+        ) as span:
+            with tempfile.TemporaryDirectory() as tmp:
+                args = [
+                    "-p",
+                    prompt,
+                    "--output-format",
+                    "json",
+                    "--disallowedTools",
+                    *_ALLOWED_TOOLS,
+                    *_DISALLOWED_TOOLS,
+                ]
+                stdout = self.run_cli(args, Path(tmp), _subscription_env(), self.timeout)
 
-        parsed = _extract_json(_result_text(stdout))
-        overall = float(parsed.get("overall", 0.0))
-        return max(0.0, min(1.0, overall))
+            parsed = _extract_json(_result_text(stdout))
+            overall = max(0.0, min(1.0, float(parsed.get("overall", 0.0))))
+            per_item = {k: float(v) for k, v in (parsed.get("per_item") or {}).items()}
+            usage = _claude_usage(stdout)
+            tracing.record_output(
+                span,
+                output=stdout,
+                prompt_tokens=usage.get("input_tokens"),
+                completion_tokens=usage.get("output_tokens"),
+                cost_usd=usage.get("cost_usd"),
+                **{"praxis.case_id": ctx.case_id, "praxis.overall": overall},
+            )
+            return JudgeResult(overall=overall, per_item=per_item, raw_response=stdout)

@@ -7,7 +7,7 @@ CREATED: 2026-06-18
 PURPOSE:
 Protocol and factory for candidate data access. UI components depend on this
 interface — not on pandas, mock_data, or HTTP — so React or another client
-can share Matthew's API without importing Streamlit code.
+can share Matthew's API without importing dashboard UI code.
 
 USAGE:
     provider = get_data_provider()
@@ -16,6 +16,8 @@ USAGE:
 OPERATIONAL:
 - PRAXIS_API_BASE_URL unset → MockDataProvider (local dev, no backend)
 - PRAXIS_API_BASE_URL set     → ApiDataProvider (Days 6–7 integration)
+- PRAXIS_API_TOKEN            → Cognito Bearer JWT for the live API
+- PRAXIS_ORG_ID               → active org sent as X-Praxis-Org (default "default")
 ===============================================================================
 """
 
@@ -69,7 +71,8 @@ def get_data_provider() -> DataProvider:
         from services.api_client import ApiDataProvider
 
         token = os.environ.get("PRAXIS_API_TOKEN")
-        return ApiDataProvider(base_url=base_url, token=token)
+        org_id = os.environ.get("PRAXIS_ORG_ID", "default").strip() or "default"
+        return ApiDataProvider(base_url=base_url, token=token, org_id=org_id)
 
     from services.mock_provider import MockDataProvider
 

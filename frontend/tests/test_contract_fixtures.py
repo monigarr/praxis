@@ -9,8 +9,11 @@ import pytest
 
 from models.candidate import Candidate, CandidateState
 from services.contract_v1 import (
+    CONTRACT_HEADER,
+    ORG_HEADER,
     build_promote_body,
     build_resolve_body,
+    contract_headers,
     contradiction_pair_id,
     normalize_resolution,
     parse_candidate_list,
@@ -46,6 +49,20 @@ def test_resolve_request_fixture_matches_builder() -> None:
     assert built == expected
 
 
+def test_contract_headers_includes_auth_and_org_when_provided() -> None:
+    headers = contract_headers(token="t", org_id="acme")
+    assert headers["Authorization"] == "Bearer t"
+    assert headers[ORG_HEADER] == "acme"
+    assert headers[CONTRACT_HEADER] == "1"
+
+
+def test_contract_headers_omits_auth_and_org_when_absent() -> None:
+    headers = contract_headers()
+    assert "Authorization" not in headers
+    assert ORG_HEADER not in headers
+    assert headers[CONTRACT_HEADER] == "1"
+
+
 def test_resolution_mapping_ui_to_api() -> None:
     assert normalize_resolution("keep_primary") == "keep_a"
     assert normalize_resolution("keep_rival") == "keep_b"
@@ -68,3 +85,22 @@ def test_eval_metrics_fixture_has_required_curve() -> None:
     assert isinstance(series, list) and len(series) >= 2
     assert metrics.get("corrections_before") is not None
     assert metrics.get("corrections_after") is not None
+
+
+def test_ingest_jsonl_request_fixture_shape() -> None:
+    payload = _load_json("ingest-jsonl-request.json")
+    assert isinstance(payload, dict)
+    files = payload.get("files")
+    assert isinstance(files, list) and len(files) >= 1
+    first = files[0]
+    assert isinstance(first, dict)
+    assert isinstance(first.get("name"), str) and first["name"]
+    assert isinstance(first.get("content"), str)
+
+
+def test_ingest_jsonl_response_fixture_shape() -> None:
+    payload = _load_json("ingest-jsonl-response.json")
+    assert isinstance(payload, dict)
+    assert isinstance(payload.get("candidatesCreated"), int)
+    assert isinstance(payload.get("candidateIds"), list)
+    assert isinstance(payload.get("provenance"), list)

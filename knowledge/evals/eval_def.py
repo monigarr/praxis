@@ -12,6 +12,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from knowledge.evals.repo.repo_task_def import RepoTask
+
 
 class DeterministicCheckRef(BaseModel):
     """Points at a registered callable in ``evals/deterministic_checks/``.
@@ -64,7 +66,11 @@ class EvalCase(BaseModel):
     target_commit: str | None = None  # full-pipeline: desired end state / reference
     start_commit: str | None = None  # optional; None => clean baseline
     repo: str | None = None  # where the commits live (defaults to this repo)
+    code_task: RepoTask | None = None  # real-repo (SWE-bench-style) task: clone+test oracle
     fixture_path: str | None = None  # abs path to a dir copied into the box as start state; set by load_case
+    needs: list[str] = Field(default_factory=list)  # runner capabilities required (e.g. "sandbox"); a backend that can't provide them skips the case
+    xfail: str | None = None  # if set, the case is expected to fail (reason = the unbuilt capability); a real fail reports XFAIL, an unexpected pass reports XPASS
+    model: str | None = None  # pin the runner's model (e.g. "openai/gpt-4o-mini", "sonnet"); None => the backend's default. NB: model ids are backend-specific
     seeded_insight: SeededInsight = Field(default_factory=SeededInsight)
     deterministic_checks: list[DeterministicCheckRef] = Field(default_factory=list)
     rubric: Rubric | None = None
@@ -87,11 +93,19 @@ class EvalCase(BaseModel):
 
 
 class EvalContext(BaseModel):
-    """What graders see: the agent's produced output and where it ran."""
+    """What graders see: the agent's produced output and where it ran.
+
+    The trailing fields are *provenance* for the run transcript — they don't
+    affect grading. A runner with nothing to report (e.g. ``FakeRunner``) leaves
+    them ``None``.
+    """
 
     case_id: str
     output: str  # produced diff / files / text
     checkout_path: str | None = None  # working dir the run happened in
+    raw_response: str | None = None  # full agent CLI stdout (json: result + cost/usage/turns)
+    output_source: str | None = None  # which artifact `output` came from
+    injected_knowledge: str | None = None  # what the graph reader fed into the system prompt
 
 
 class CheckResult(BaseModel):
@@ -104,8 +118,43 @@ class CheckResult(BaseModel):
 # resolved from a DeterministicCheckRef.ref and called with ref.params as kwargs.
 
 
+class JudgeResult(BaseModel):
+    """What a rubric judge returns: the overall score plus its provenance."""
+
+    overall: float  # weighted average in [0, 1] — the value that drives the verdict
+    per_item: dict[str, float] = Field(default_factory=dict)  # per-criterion scores
+    raw_response: str | None = None  # the judge's full CLI stdout
+
+
 class CaseResult(BaseModel):
     case_id: str
     checks: list[CheckResult] = Field(default_factory=list)
     rubric_score: float | None = None
-    passed: bool  # overall verdict for the baseline row
+    passed: bool  # raw verdict: did checks + rubric pass? (independent of xfail)
+    xfail_reason: str | None = None  # carried from the case; drives PASS/FAIL/XFAIL/XPASS
+
+
+class AgentRun(BaseModel):
+    """The agent half of a transcript: what it produced and the raw response."""
+
+    raw_response: str | None = None
+    output: str = ""
+    output_source: str | None = None
+
+
+class RunTranscript(BaseModel):
+    """The full, verbose record of one case in one run.
+
+    Written per-case to ``results/runs/<run_id>/<case_id>.json`` — the scoreboard
+    (``baseline.jsonl``) stays compact; this carries everything for debugging:
+    the raw agent + judge responses (cost/usage/turns ride along inside them),
+    the injected knowledge, and the graded verdict.
+    """
+
+    run_id: str
+    case_id: str
+    seed_prompt: str
+    injected_knowledge: str = ""
+    agent: AgentRun
+    judge: JudgeResult | None = None
+    verdict: CaseResult

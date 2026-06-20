@@ -1,16 +1,22 @@
 import {
+  buildCreateBody,
   buildPromoteBody,
   buildPromoteBodyImplicit,
   buildRejectBody,
   buildResolveBody,
+  buildUpdateBody,
   contractHeaders,
 } from "./contract";
 import {
   candidateFromMapping,
   parseCandidateList,
 } from "./candidateModel";
+import {
+  deriveGraphFromCandidates,
+  parseGraphPayload,
+} from "./graphModel";
 import type { DataProvider } from "./dataProvider";
-import type { EvalMetrics } from "../types/candidate";
+import type { CandidateWriteInput, EvalMetrics } from "../types/candidate";
 
 class ApiConflictError extends Error {
   readonly statusCode = 409 as const;
@@ -42,6 +48,17 @@ function extractCandidateId(path: string): string | undefined {
   return segment ? decodeURIComponent(segment) : undefined;
 }
 
+function isPromoteConflict(error: ApiClientError): boolean {
+  return (
+    error.statusCode === 400 &&
+    error.message.toLowerCase().includes("cannot promote")
+  );
+}
+
+function toPromoteConflict(error: ApiClientError, candidateId: string): ApiConflictError {
+  return new ApiConflictError(error.message, candidateId);
+}
+
 async function parseJsonResponse(response: Response): Promise<unknown> {
   const raw = await response.text();
   if (!raw.trim()) {
@@ -50,11 +67,28 @@ async function parseJsonResponse(response: Response): Promise<unknown> {
   return JSON.parse(raw) as unknown;
 }
 
+export interface ApiDataProviderAuth {
+  /** Resolve a currently-valid bearer token (Amplify refreshes on demand). */
+  getToken?: () => Promise<string | undefined>;
+  /** Active org id sent as X-Praxis-Org for server-side tenancy. */
+  orgId?: string;
+}
+
 export function createApiDataProvider(
   baseUrl: string,
-  token?: string,
+  auth?: ApiDataProviderAuth,
+  evalMetricsUrl?: string,
 ): DataProvider {
   const root = baseUrl.replace(/\/$/, "");
+  const metricsUrl =
+    evalMetricsUrl?.trim() ||
+    import.meta.env.VITE_PRAXIS_EVAL_METRICS_URL?.trim() ||
+    `${root}/metrics`;
+
+  async function authHeaders(): Promise<HeadersInit> {
+    const token = auth?.getToken ? await auth.getToken() : undefined;
+    return contractHeaders(token, auth?.orgId);
+  }
 
   async function request(
     method: string,
@@ -63,7 +97,7 @@ export function createApiDataProvider(
   ): Promise<unknown> {
     const response = await fetch(`${root}${path}`, {
       method,
-      headers: contractHeaders(token),
+      headers: await authHeaders(),
       body: body ? JSON.stringify(body) : undefined,
     });
 
@@ -120,12 +154,25 @@ export function createApiDataProvider(
         const payload = await request("POST", path, buildPromoteBody(current.state));
         return candidateFromMapping(payload as Record<string, unknown>);
       } catch (error) {
+        if (error instanceof ApiClientError && isPromoteConflict(error)) {
+          throw toPromoteConflict(error, id);
+        }
         if (
           error instanceof ApiClientError &&
           (error.statusCode === 400 || error.statusCode === 422)
         ) {
-          const payload = await request("POST", path, buildPromoteBodyImplicit());
-          return candidateFromMapping(payload as Record<string, unknown>);
+          try {
+            const payload = await request("POST", path, buildPromoteBodyImplicit());
+            return candidateFromMapping(payload as Record<string, unknown>);
+          } catch (retryError) {
+            if (
+              retryError instanceof ApiClientError &&
+              isPromoteConflict(retryError)
+            ) {
+              throw toPromoteConflict(retryError, id);
+            }
+            throw retryError;
+          }
         }
         throw error;
       }
@@ -139,6 +186,24 @@ export function createApiDataProvider(
       );
     },
 
+    async createCandidate(input: CandidateWriteInput) {
+      const payload = await request("POST", "/candidates", buildCreateBody(input));
+      return candidateFromMapping(payload as Record<string, unknown>);
+    },
+
+    async updateCandidate(id, input) {
+      const payload = await request(
+        "PATCH",
+        `/candidates/${encodeURIComponent(id)}`,
+        buildUpdateBody(input),
+      );
+      return candidateFromMapping(payload as Record<string, unknown>);
+    },
+
+    async deleteCandidate(id) {
+      await request("DELETE", `/candidates/${encodeURIComponent(id)}`);
+    },
+
     async resolveContradiction(contradictionId, resolution, keepId) {
       const payload = await request(
         "POST",
@@ -149,31 +214,80 @@ export function createApiDataProvider(
     },
 
     async getEvalMetrics() {
-      const url = import.meta.env.VITE_PRAXIS_EVAL_METRICS_URL?.trim();
-      if (!url) {
-        return {
-          source: "placeholder",
-          correctionRate: [1.0, 0.72, 0.48, 0.35],
-        };
-      }
-
       try {
-        const response = await fetch(url, {
-          headers: contractHeaders(token),
+        const response = await fetch(metricsUrl, {
+          headers: await authHeaders(),
         });
         if (!response.ok) {
           throw new Error(response.statusText);
         }
         const payload = (await response.json()) as Record<string, unknown>;
-        return normalizeEvalMetrics(payload, url);
-      } catch {
+        return normalizeEvalMetrics(payload, metricsUrl);
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Eval metrics unavailable";
         return {
           source: "placeholder",
           correctionRate: [1.0, 0.72, 0.48, 0.35],
+          sessions: ["cold", "run_1", "run_2", "run_3"],
+          correctionsBefore: 12,
+          correctionsAfter: 5,
+          fetchError: message,
         };
       }
     },
+
+    async getGraph() {
+      try {
+        const payload = await request("GET", "/graph");
+        return parseGraphPayload(payload, "api");
+      } catch (error) {
+        if (
+          error instanceof ApiClientError &&
+          (error.statusCode === 404 || error.statusCode === 405)
+        ) {
+          const rows = await this.listCandidates();
+          return deriveGraphFromCandidates(rows);
+        }
+        if (error instanceof ApiClientError) {
+          const rows = await this.listCandidates();
+          return deriveGraphFromCandidates(rows);
+        }
+        throw error;
+      }
+    },
+
+    async getTranscript() {
+      return null;
+    },
   };
+}
+
+export async function postIngestJsonl(
+  apiBaseUrl: string,
+  files: Array<{ name: string; content: string }>,
+  auth?: string | ApiDataProviderAuth,
+): Promise<void> {
+  const root = apiBaseUrl.replace(/\/$/, "");
+  const resolved: ApiDataProviderAuth =
+    typeof auth === "string" ? { getToken: async () => auth } : auth ?? {};
+  const token = resolved.getToken ? await resolved.getToken() : undefined;
+  const response = await fetch(`${root}/ingest/jsonl`, {
+    method: "POST",
+    headers: contractHeaders(token, resolved.orgId),
+    body: JSON.stringify({ files }),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text();
+    if (response.status === 404 || response.status === 405) {
+      throw new Error("Distillation endpoint not available yet");
+    }
+    throw new ApiClientError(
+      `API POST /ingest/jsonl failed (${response.status}): ${detail || response.statusText}`,
+      response.status,
+    );
+  }
 }
 
 function normalizeEvalMetrics(

@@ -1,0 +1,36 @@
+# Scenario: CONFLICT / recency tie-break. The seeded graph holds two equally
+# specific rules about the default log level — one dated 2023-01 (INFO) and one
+# dated 2024-06 marked AUTHORITATIVE UPDATE (DEBUG). The agent must write a
+# one-line config note stating the default log level to answer.txt.
+#
+# Scope: full-pipeline (real Claude Code agent over the seeded graph). No
+# component set.
+#
+# Expected under a real run: PASS. A capable agent reading both insights should
+# prefer the newer, explicitly-authoritative 2024-06 rule and answer DEBUG.
+#
+# Fully deterministic on purpose: the one-line artifact exposes the *outcome*
+# (DEBUG vs INFO) but not the *reasoning*, so an LLM rubric can only guess at the
+# recency logic — it added flakiness, not signal. The outcome is the whole test:
+# DEBUG present AND INFO absent crisply separates the right answer from the wrong
+# one (and from a non-compliant hedge like "DEBUG (was INFO)").
+id: recency_tiebreak_newer_wins
+seed_prompt: |
+  The knowledge graph contains two rules about the application's default log
+  level. Decide which one currently applies and write a single one-line config
+  note stating the default log level (e.g. "Default log level: <LEVEL>.") to a
+  file named answer.txt in the current directory. Write only that one line.
+target_commit: "0000000000000000000000000000000000000000"
+seeded_insight:
+  direct_to_graph:
+    - "[2023-01] Default log level is INFO."
+    - "[2024-06] AUTHORITATIVE UPDATE: default log level is now DEBUG."
+deterministic_checks:
+  - name: states_debug
+    ref: knowledge.evals.deterministic_checks.builds:contains_text
+    params:
+      text: "DEBUG"
+  - name: not_info
+    ref: knowledge.evals.deterministic_checks.builds:not_contains_text
+    params:
+      text: "INFO"

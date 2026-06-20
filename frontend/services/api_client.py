@@ -62,14 +62,20 @@ class ApiDataProvider:
     """
     Thin HTTP client over Matthew's REST API.
 
-    A future React app in frontend-react/ should call the same endpoints —
-    this class is Streamlit-specific only in that it returns Candidate models
-    for the dashboard; the API contract itself is UI-agnostic.
+    Python reference client for candidate-api-v1 — returns typed Candidate models.
+    The React dashboard in frontend-react/ calls the same endpoints; the contract
+    itself is UI-agnostic.
     """
 
-    def __init__(self, base_url: str, token: str | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        token: str | None = None,
+        org_id: str | None = None,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._token = token
+        self._org_id = org_id
 
     def list_candidates(self, state: CandidateState | None = None) -> list[Candidate]:
         query = ""
@@ -103,13 +109,26 @@ class ApiDataProvider:
         try:
             payload = self._request("POST", path, body=explicit_body)
         except ApiClientError as exc:
+            if _is_promote_conflict(exc):
+                raise ApiConflictError(
+                    f"Conflict: {exc}",
+                    candidate_id=candidate_id,
+                ) from exc
             if exc.status_code not in (400, 422):
                 raise
             logger.info(
                 "Promote with targetState rejected (%s); retrying with implicit body",
                 exc.status_code,
             )
-            payload = self._request("POST", path, body=build_promote_body_implicit())
+            try:
+                payload = self._request("POST", path, body=build_promote_body_implicit())
+            except ApiClientError as retry_exc:
+                if _is_promote_conflict(retry_exc):
+                    raise ApiConflictError(
+                        f"Conflict: {retry_exc}",
+                        candidate_id=candidate_id,
+                    ) from retry_exc
+                raise
 
         if not isinstance(payload, dict):
             raise ValueError("Promote response must be a candidate object")
@@ -138,7 +157,7 @@ class ApiDataProvider:
         return Candidate.from_mapping(payload)
 
     def _headers(self) -> dict[str, str]:
-        return contract_headers(token=self._token)
+        return contract_headers(token=self._token, org_id=self._org_id)
 
     def _request(
         self,
@@ -165,6 +184,21 @@ class ApiDataProvider:
                     f"Conflict (409): {detail or exc.reason}",
                     candidate_id=_extract_candidate_id(path),
                 ) from exc
+            if exc.code in (401, 403):
+                # The server requires a Cognito Bearer JWT (PRAXIS_API_TOKEN) and an
+                # org the caller belongs to (PRAXIS_ORG_ID -> X-Praxis-Org). Surface
+                # that explicitly instead of a generic API error.
+                hint = (
+                    "missing or invalid bearer token"
+                    if exc.code == 401
+                    else "token valid but not a member of the requested org"
+                )
+                raise ApiClientError(
+                    f"API {method} {path} unauthorized ({exc.code}): {hint}. "
+                    f"Set PRAXIS_API_TOKEN and PRAXIS_ORG_ID (or PRAXIS_AUTH_DISABLED=1 "
+                    f"on a dev server). Detail: {detail or exc.reason}",
+                    status_code=exc.code,
+                ) from exc
             raise ApiClientError(
                 f"API {method} {path} failed ({exc.code}): {detail or exc.reason}",
                 status_code=exc.code,
@@ -180,3 +214,10 @@ def _extract_candidate_id(path: str) -> str | None:
     remainder = path.split(prefix, 1)[1]
     segment = remainder.split("/", 1)[0]
     return urllib.parse.unquote(segment) if segment else None
+
+
+def _is_promote_conflict(exc: ApiClientError) -> bool:
+    """Matthew's server returns 400 PromotionError for stale/invalid promote."""
+    if exc.status_code != 400:
+        return False
+    return "cannot promote" in str(exc).lower()

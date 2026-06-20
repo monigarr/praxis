@@ -4,23 +4,14 @@
 
 ## Setup (before recording)
 
-**Streamlit (Monica's sprint demo path):**
-
-```powershell
-cd frontend
-.\venv\Scripts\streamlit run app.py
-```
-
-**React (Matthew API validation — optional second take):**
-
 ```powershell
 cd frontend-react
 npm run dev
 ```
 
-Confirm mock mode banner (no `PRAXIS_API_BASE_URL` / `VITE_PRAXIS_API_BASE_URL`). Filter state = **All**.
+Open http://localhost:5173 — confirm mock mode banner (no `VITE_PRAXIS_API_BASE_URL`).
 
-For live API rehearsal: set env vars, use sidebar **Refresh data** after mutations.
+For live API rehearsal: set env vars per [INTEGRATION_SMOKE.md](INTEGRATION_SMOKE.md); reload the page after mutations.
 
 ## Beat 1 — Problem framing (20s)
 
@@ -65,8 +56,7 @@ Expand **Eval metrics** — placeholder or live curve if `PRAXIS_EVAL_METRICS_UR
 
 ## Video capture checklist
 
-- [ ] 1920×1080 window, light theme (default Streamlit)
-- [ ] Zoom candidate detail expander before breakdown shot
+- [ ] 1920×1080 window, light theme (default React)
+- [ ] Zoom candidate detail panel before breakdown shot
 - [ ] Capture confirmation dialog + low-confidence warning (if applicable) + success banner
 - [ ] Optional: split-screen with JSONL log file for provenance punch-in
-- [ ] Optional: second take from `frontend-react/` for React client parity

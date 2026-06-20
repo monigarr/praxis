@@ -1,10 +1,32 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { getDataProvider } from "../api/mockProvider";
+import { resolveDataProvider } from "../api/providerFactory";
+import type { ApiDataProviderAuth } from "../api/apiClient";
 import type { DataProvider } from "../api/dataProvider";
-import type { Candidate } from "../types/candidate";
+import type { DataSourceConfig } from "../config/dataSource";
+import type { Candidate, CandidateWriteInput } from "../types/candidate";
+import type { ParsedLogSession } from "../types/transcript";
 
-export function useCandidates() {
-  const provider = useMemo<DataProvider>(() => getDataProvider(), []);
+export interface UseCandidatesOptions {
+  config: DataSourceConfig;
+  providerOverride?: DataProvider;
+  localSession?: ParsedLogSession | null;
+  auth?: ApiDataProviderAuth;
+}
+
+export function useCandidates(options: UseCandidatesOptions) {
+  const { config, providerOverride, localSession, auth } = options;
+  const getToken = auth?.getToken;
+  const orgId = auth?.orgId;
+  const provider = useMemo<DataProvider>(
+    () =>
+      providerOverride ??
+      resolveDataProvider(
+        config,
+        localSession,
+        getToken ? { getToken, orgId } : undefined,
+      ),
+    [config, localSession, providerOverride, getToken, orgId],
+  );
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -28,6 +50,10 @@ export function useCandidates() {
     void refresh();
   }, [refresh]);
 
+  useEffect(() => {
+    setLastAction(null);
+  }, [config]);
+
   const promote = useCallback(
     async (id: string) => {
       const updated = await provider.promote(id);
@@ -42,7 +68,7 @@ export function useCandidates() {
       await provider.reject(id, reason);
       await refresh();
       const note = reason ? ` (reason: ${reason})` : "";
-      setLastAction(`Rejected candidate ${id}${note}.`);
+      setLastAction(`Decayed eval ${id}${note}.`);
     },
     [provider, refresh],
   );
@@ -61,6 +87,36 @@ export function useCandidates() {
     [provider, refresh],
   );
 
+  const createCandidate = useCallback(
+    async (input: CandidateWriteInput) => {
+      const created = await provider.createCandidate(input);
+      await refresh();
+      setLastAction(`Added eval "${created.title}".`);
+      return created;
+    },
+    [provider, refresh],
+  );
+
+  const updateCandidate = useCallback(
+    async (id: string, input: CandidateWriteInput) => {
+      const updated = await provider.updateCandidate(id, input);
+      setCandidates((prev) => prev.map((c) => (c.id === id ? updated : c)));
+      setLastAction(`Updated eval "${updated.title}".`);
+      return updated;
+    },
+    [provider],
+  );
+
+  const deleteCandidate = useCallback(
+    async (id: string) => {
+      const existing = candidates.find((c) => c.id === id);
+      await provider.deleteCandidate(id);
+      await refresh();
+      setLastAction(`Deleted eval "${existing?.title ?? id}".`);
+    },
+    [provider, refresh, candidates],
+  );
+
   return {
     provider,
     candidates,
@@ -72,6 +128,9 @@ export function useCandidates() {
     promote,
     reject,
     resolveContradiction,
+    createCandidate,
+    updateCandidate,
+    deleteCandidate,
   };
 }
 

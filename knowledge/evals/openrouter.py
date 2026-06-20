@@ -18,10 +18,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.error
 import urllib.request
 from typing import Callable
 
-from knowledge.evals.eval_def import EvalContext, Rubric
+from knowledge.evals.eval_def import EvalContext, JudgeResult, Rubric
+from knowledge.observability import tracing
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "openai/gpt-4o-mini"
@@ -34,8 +36,14 @@ def _default_post(url: str, payload: dict, headers: dict, timeout: int) -> str:
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed URL
-        return resp.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed URL
+            return resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        # The 4xx body names the actual cause (e.g. an invalid model id); a bare
+        # "HTTP Error 400" would hide it. Surface it.
+        body = e.read().decode("utf-8", "replace").strip()[:500]
+        raise RuntimeError(f"OpenRouter HTTP {e.code}: {body}") from e
 
 
 def _extract_json(text: str) -> dict:
@@ -76,10 +84,29 @@ class OpenRouterClient:
         model: str | None = None,
     ) -> str:
         """Return the assistant message text for one chat completion."""
+        text, _ = self.complete_raw(
+            messages, temperature=temperature, max_tokens=max_tokens, model=model
+        )
+        return text
+
+    def complete_raw(
+        self,
+        messages: list[dict],
+        *,
+        temperature: float = 0.0,
+        max_tokens: int = 1024,
+        model: str | None = None,
+    ) -> tuple[str, str]:
+        """Like :meth:`complete`, but also return the raw response body.
+
+        The raw body carries usage/model/id metadata, so the transcript keeps it
+        verbatim — the parallel to ``ClaudeCodeRunner``'s ``raw_response``.
+        """
         if not self.api_key:
             raise RuntimeError("set OPENROUTER_API_KEY to use the OpenRouter backend")
+        model_name = model or self.model
         payload = {
-            "model": model or self.model,
+            "model": model_name,
             "messages": messages,
             "temperature": temperature,  # greedy by default for determinism
             "max_tokens": max_tokens,
@@ -96,9 +123,19 @@ class OpenRouterClient:
         if title:
             headers["X-Title"] = title
 
-        raw = self.post(OPENROUTER_URL, payload, headers, self.timeout)
-        data = json.loads(raw)
-        return data["choices"][0]["message"]["content"]
+        with tracing.llm_span("openrouter.chat", model=model_name, input_value=messages) as span:
+            raw = self.post(OPENROUTER_URL, payload, headers, self.timeout)
+            data = json.loads(raw)
+            content = data["choices"][0]["message"]["content"]
+            usage = data.get("usage") or {}
+            tracing.record_output(
+                span,
+                output=content,
+                prompt_tokens=usage.get("prompt_tokens"),
+                completion_tokens=usage.get("completion_tokens"),
+                total_tokens=usage.get("total_tokens"),
+            )
+            return content, raw
 
 
 class OpenRouterRunner:
@@ -108,6 +145,16 @@ class OpenRouterRunner:
     the system prompt; ``seed_prompt`` is the user turn; the reply text is the
     graded output. Use for cheap iteration; use ``ClaudeCodeRunner`` for fidelity.
     """
+
+    # Single-shot text: no working dir, no file edits. Cases that need a sandbox
+    # are skipped rather than graded on a reply this runner can't make faithful.
+    provides = frozenset()
+
+    @staticmethod
+    def serves_model(model: str) -> bool:
+        """OpenRouter ids are provider-prefixed (e.g. ``openai/gpt-4o-mini``); a
+        bare alias like ``sonnet`` belongs to another backend."""
+        return "/" in model
 
     def __init__(
         self,
@@ -125,19 +172,28 @@ class OpenRouterRunner:
         if knowledge.strip():
             messages.append({"role": "system", "content": knowledge})
         messages.append({"role": "user", "content": case.seed_prompt})
-        output = self.client.complete(
-            messages, temperature=self.temperature, max_tokens=self.max_tokens
+        output, raw = self.client.complete_raw(
+            messages,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            model=getattr(case, "model", None),  # case override; None => client default
         )
-        return EvalContext(case_id=case.id, output=output)
+        return EvalContext(
+            case_id=case.id,
+            output=output,
+            raw_response=raw,
+            output_source="completion",  # single-shot reply, no tools/files
+            injected_knowledge=knowledge,
+        )
 
 
 class OpenRouterJudge:
-    """Rubric judge via a cheap OpenRouter model. Returns a score in [0, 1]."""
+    """Rubric judge via a cheap OpenRouter model. Returns a :class:`JudgeResult`."""
 
     def __init__(self, client: OpenRouterClient | None = None) -> None:
         self.client = client or OpenRouterClient()
 
-    def __call__(self, rubric: Rubric, ctx: EvalContext) -> float:
+    def __call__(self, rubric: Rubric, ctx: EvalContext) -> JudgeResult:
         items = "\n".join(
             f"- ({it.weight}) {it.id}: {it.criterion}" for it in rubric.items
         )
@@ -148,11 +204,13 @@ class OpenRouterJudge:
             "No prose.\n\n"
             f"RUBRIC:\n{items}\n\nARTIFACT:\n{ctx.output}\n"
         )
-        text = self.client.complete(
+        text, raw = self.client.complete_raw(
             [{"role": "user", "content": prompt}], temperature=0.0, max_tokens=512
         )
-        overall = float(_extract_json(text).get("overall", 0.0))
-        return max(0.0, min(1.0, overall))
+        parsed = _extract_json(text)
+        overall = max(0.0, min(1.0, float(parsed.get("overall", 0.0))))
+        per_item = {k: float(v) for k, v in (parsed.get("per_item") or {}).items()}
+        return JudgeResult(overall=overall, per_item=per_item, raw_response=raw)
 
 
 def openrouter_llm(client: OpenRouterClient | None = None) -> Callable[[str], str]:
